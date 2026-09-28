@@ -1,3 +1,4 @@
+use crate::window::a11y::A11ySubtree;
 use crate::{
     AnyElement, AnyEntity, AnyWeakEntity, App, AvailableSpace, Bounds, ContentMask, Context,
     Element, ElementId, Entity, EntityId, GlobalElementId, InspectorElementId, IntoElement,
@@ -297,6 +298,9 @@ struct ViewElementState {
     paint_range: Range<PaintIndex>,
     cache_key: ViewElementCacheKey,
     accessed_entities: FxHashSet<EntityId>,
+    /// What the view added to the accessibility tree when it was drawn, if
+    /// accessibility was active then.
+    a11y: Option<A11ySubtree>,
 }
 
 struct ViewElementCacheKey {
@@ -487,9 +491,15 @@ fn prepaint_view(
                     && element_state.cache_key.text_style == text_style
                     && !window.dirty_views.contains(&entity_id)
                     && !window.refreshing
+                    && (element_state.a11y.is_some() || !window.a11y.is_active())
                 {
                     let prepaint_start = window.prepaint_index();
                     window.reuse_prepaint(element_state.prepaint_range.clone());
+                    if let Some(subtree) = &element_state.a11y
+                        && window.a11y.is_active()
+                    {
+                        window.a11y.replay(subtree);
+                    }
                     cx.entities
                         .extend_accessed(&element_state.accessed_entities);
                     let prepaint_end = window.prepaint_index();
@@ -500,6 +510,7 @@ fn prepaint_view(
 
                 let refreshing = mem::replace(&mut window.refreshing, true);
                 let prepaint_start = window.prepaint_index();
+                let a11y_mark = window.a11y.mark();
                 let (element, accessed_entities) = cx.detect_accessed_entities(|cx| {
                     let mut element = render(window, cx);
                     element.layout_as_root(Size::<AvailableSpace>::from(bounds.size), window, cx);
@@ -509,11 +520,16 @@ fn prepaint_view(
 
                 let prepaint_end = window.prepaint_index();
                 window.refreshing = refreshing;
+                let a11y = window
+                    .a11y
+                    .is_active()
+                    .then(|| window.a11y.subtree_since(&a11y_mark));
 
                 (
                     Some(element),
                     ViewElementState {
                         accessed_entities,
+                        a11y,
                         prepaint_range: prepaint_start..prepaint_end,
                         paint_range: PaintIndex::default()..PaintIndex::default(),
                         cache_key: ViewElementCacheKey {
@@ -566,6 +582,11 @@ fn paint_view(
                         window.refreshing = refreshing;
                     } else {
                         window.reuse_paint(element_state.paint_range.clone());
+                        if let Some(subtree) = &element_state.a11y
+                            && window.a11y.is_active()
+                        {
+                            window.a11y.replay_action_listeners(subtree);
+                        }
                     }
 
                     let paint_end = window.paint_index();

@@ -149,6 +149,9 @@ pub(crate) struct A11y {
     pub(crate) focus_ids: FxHashMap<NodeId, FocusId>,
     pub(crate) node_bounds: FxHashMap<NodeId, Bounds<Pixels>>,
     pub(crate) action_listeners: FxHashMap<NodeId, Vec<(Action, A11yActionListener)>>,
+    /// The last frame's action listeners, for a cached view whose paint this
+    /// frame replays to take back (see [`Self::replay_action_listeners`]).
+    previous_action_listeners: FxHashMap<NodeId, Vec<(Action, A11yActionListener)>>,
     /// The window's title, used to label the root node so assistive
     /// technology can tell windows apart.
     window_title: Option<SharedString>,
@@ -177,6 +180,7 @@ impl A11y {
             focus_ids: FxHashMap::default(),
             node_bounds: FxHashMap::default(),
             action_listeners: FxHashMap::default(),
+            previous_action_listeners: FxHashMap::default(),
             window_title,
             last_focus_without_node: None,
             debug: debug::A11yDebug::default(),
@@ -219,6 +223,64 @@ impl A11y {
 
     pub(crate) fn is_active(&self) -> bool {
         self.active_this_frame
+    }
+
+    /// Where the tree stands now, to collect what is added after it with
+    /// [`Self::subtree_since`].
+    pub(crate) fn mark(&self) -> A11yMark {
+        A11yMark {
+            nodes: self.nodes.all_nodes.len(),
+            children: self.nodes.current_children().len(),
+            focus: self.nodes.focus,
+            active_descendant: self.nodes.active_descendant,
+        }
+    }
+
+    /// What was added to the tree since `mark`, which must have been taken
+    /// with the same node current, as when a view is drawn.
+    pub(crate) fn subtree_since(&self, mark: &A11yMark) -> A11ySubtree {
+        let nodes = self.nodes.all_nodes[mark.nodes..].to_vec();
+        let bounds = nodes
+            .iter()
+            .filter_map(|(id, _)| Some((*id, *self.node_bounds.get(id)?)))
+            .collect();
+        let focusable = nodes
+            .iter()
+            .filter_map(|(id, _)| Some((*id, *self.focus_ids.get(id)?)))
+            .collect();
+        let added = |before: Option<NodeId>, now: Option<NodeId>| now.filter(|_| now != before);
+        A11ySubtree {
+            top_level: self.nodes.current_children()[mark.children..].to_vec(),
+            nodes,
+            bounds,
+            focusable,
+            focus: added(mark.focus, self.nodes.focus),
+            active_descendant: added(mark.active_descendant, self.nodes.active_descendant),
+        }
+    }
+
+    /// Adds `subtree` to the tree under the current node, as drawing its view
+    /// again would.
+    pub(crate) fn replay(&mut self, subtree: &A11ySubtree) {
+        self.nodes.replay(subtree);
+        self.node_bounds.extend(subtree.bounds.iter().copied());
+        self.focus_ids.extend(subtree.focusable.iter().copied());
+        if let Some(focus) = subtree.focus {
+            self.nodes.set_focus(focus);
+        }
+        if let Some(active_descendant) = subtree.active_descendant {
+            self.nodes.set_active_descendant(active_descendant);
+        }
+    }
+
+    /// Takes back the last frame's action listeners for `subtree`'s nodes,
+    /// whose paint this frame replays rather than repeats.
+    pub(crate) fn replay_action_listeners(&mut self, subtree: &A11ySubtree) {
+        for (id, _) in &subtree.nodes {
+            if let Some(listeners) = self.previous_action_listeners.remove(id) {
+                self.action_listeners.insert(*id, listeners);
+            }
+        }
     }
 
     /// Turns accessibility on as a platform adapter would, from the next frame.
@@ -287,7 +349,7 @@ impl A11y {
     pub(crate) fn begin_frame(&mut self) {
         self.focus_ids.clear();
         self.node_bounds.clear();
-        self.action_listeners.clear();
+        self.previous_action_listeners = std::mem::take(&mut self.action_listeners);
         self.nodes.begin_frame(self.window_title.as_ref());
     }
 
@@ -380,6 +442,27 @@ impl<'a> A11ySubtreeBuilder<'a> {
     }
 }
 
+/// Where the tree stood before a view was drawn; see [`A11y::mark`].
+pub(crate) struct A11yMark {
+    nodes: usize,
+    children: usize,
+    focus: Option<NodeId>,
+    active_descendant: Option<NodeId>,
+}
+
+/// The part of the tree a cached view added when it was last drawn, to add
+/// again on frames that replay the view instead of drawing it.
+#[derive(Clone, Default)]
+pub(crate) struct A11ySubtree {
+    nodes: Vec<(NodeId, accesskit::Node)>,
+    /// The nodes that hang from the node the view was drawn under.
+    top_level: Vec<NodeId>,
+    bounds: Vec<(NodeId, Bounds<Pixels>)>,
+    focusable: Vec<(NodeId, FocusId)>,
+    focus: Option<NodeId>,
+    active_descendant: Option<NodeId>,
+}
+
 pub(crate) struct A11yNodeBuilder {
     ids_stack: SmallVec<[NodeId; 16]>,
     nodes_stack: SmallVec<[accesskit::Node; 16]>,
@@ -470,6 +553,23 @@ impl A11yNodeBuilder {
 
     pub(crate) fn current_node_mut(&mut self) -> Option<&mut accesskit::Node> {
         self.nodes_stack.last_mut()
+    }
+
+    fn current_children(&self) -> &[NodeId] {
+        self.nodes_stack.last().map_or(&[], |node| node.children())
+    }
+
+    fn replay(&mut self, subtree: &A11ySubtree) {
+        if let Some(parent) = self.nodes_stack.last_mut() {
+            for id in &subtree.top_level {
+                parent.push_child(*id);
+            }
+        }
+        for (id, node) in &subtree.nodes {
+            if self.can_push(*id) {
+                self.all_nodes.push((*id, node.clone()));
+            }
+        }
     }
 
     /// Pop the current node off the stack and finalize it into the all_nodes
