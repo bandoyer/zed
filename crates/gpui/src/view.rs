@@ -591,3 +591,184 @@ fn paint_component(
         element.as_mut().unwrap().paint(window, cx);
     });
 }
+
+#[cfg(test)]
+mod tests {
+    use std::{cell::Cell, rc::Rc};
+
+    use accesskit::{Action, ActionRequest, NodeId, Role, TreeId};
+
+    use crate::{
+        AppContext as _, Context, Entity, FocusHandle, InteractiveElement as _, IntoElement,
+        ParentElement as _, Render, StatefulInteractiveElement as _, StyleRefinement, Styled as _,
+        TestAppContext, VisualTestContext, div,
+    };
+
+    use super::Window;
+
+    /// A view whose one control screen readers see as a button named
+    /// "Breathe", which takes the keyboard and answers a click.
+    struct Control {
+        renders: Rc<Cell<usize>>,
+        clicks: Rc<Cell<usize>>,
+        focus: FocusHandle,
+    }
+
+    impl Render for Control {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            self.renders.set(self.renders.get() + 1);
+            let clicks = self.clicks.clone();
+            div().size_full().child(
+                div()
+                    .id("breathe")
+                    .role(Role::Button)
+                    .aria_label("Breathe")
+                    .track_focus(&self.focus)
+                    .on_a11y_action(Action::Click, move |_, _, _| clicks.set(clicks.get() + 1))
+                    .size_full(),
+            )
+        }
+    }
+
+    struct Sibling;
+
+    impl Render for Sibling {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div()
+        }
+    }
+
+    /// `control`, cached, beside a sibling whose notification alone asks for
+    /// a frame.
+    struct Frame {
+        control: Entity<Control>,
+        sibling: Entity<Sibling>,
+    }
+
+    impl Render for Frame {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .size_full()
+                .child(
+                    self.control
+                        .clone()
+                        .cached(StyleRefinement::default().size_full()),
+                )
+                .child(self.sibling.clone())
+        }
+    }
+
+    struct Setup {
+        frame: Entity<Frame>,
+        renders: Rc<Cell<usize>>,
+        clicks: Rc<Cell<usize>>,
+    }
+
+    /// A window read by assistive technology, holding a cached control.
+    fn open(cx: &mut TestAppContext) -> (Setup, &mut VisualTestContext) {
+        let (renders, clicks) = (Rc::new(Cell::new(0)), Rc::new(Cell::new(0)));
+        let (frame, cx) = cx.add_window_view({
+            let (renders, clicks) = (renders.clone(), clicks.clone());
+            move |window, cx| {
+                window.a11y.activate_for_test();
+                Frame {
+                    control: cx.new(|cx| Control {
+                        renders,
+                        clicks,
+                        focus: cx.focus_handle(),
+                    }),
+                    sibling: cx.new(|_| Sibling),
+                }
+            }
+        });
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+        let setup = Setup {
+            frame,
+            renders,
+            clicks,
+        };
+        (setup, cx)
+    }
+
+    impl Setup {
+        /// Draws a frame only the sibling asked for; the control is replayed.
+        fn draw_for_the_sibling(&self, cx: &mut VisualTestContext) {
+            let sibling = self.frame.read_with(cx, |frame, _| frame.sibling.clone());
+            sibling.update(cx, |_, cx| cx.notify());
+            cx.run_until_parked();
+        }
+
+        fn focus_the_control(&self, cx: &mut VisualTestContext) {
+            let control = self.frame.read_with(cx, |frame, _| frame.control.clone());
+            cx.update(|window, cx| {
+                let focus = control.read(cx).focus.clone();
+                window.focus(&focus, cx);
+            });
+            cx.run_until_parked();
+        }
+    }
+
+    /// The node assistive technology sees named `label`, if any.
+    fn node_named(cx: &mut VisualTestContext, label: &str) -> Option<(NodeId, Role)> {
+        cx.update(|window, _| {
+            let update = window.a11y.last_tree_update()?;
+            update
+                .nodes
+                .iter()
+                .find(|(_, node)| node.label() == Some(label))
+                .map(|(id, node)| (*id, node.role()))
+        })
+    }
+
+    fn focused_node(cx: &mut VisualTestContext) -> Option<NodeId> {
+        cx.update(|window, _| window.a11y.last_tree_update().map(|update| update.focus))
+    }
+
+    #[crate::test]
+    fn a_replayed_cached_view_keeps_its_accessibility_nodes(cx: &mut TestAppContext) {
+        let (setup, cx) = open(cx);
+        let renders = setup.renders.get();
+
+        setup.draw_for_the_sibling(cx);
+
+        assert_eq!(setup.renders.get(), renders, "the control was replayed");
+        assert_eq!(
+            node_named(cx, "Breathe").map(|(_, role)| role),
+            Some(Role::Button)
+        );
+    }
+
+    #[crate::test]
+    fn a_replayed_cached_view_keeps_the_keyboard_focus_it_holds(cx: &mut TestAppContext) {
+        let (setup, cx) = open(cx);
+        setup.focus_the_control(cx);
+
+        setup.draw_for_the_sibling(cx);
+
+        let breathe = node_named(cx, "Breathe").map(|(id, _)| id);
+        assert!(breathe.is_some());
+        assert_eq!(focused_node(cx), breathe);
+    }
+
+    #[crate::test]
+    fn a_replayed_cached_view_still_answers_assistive_technology(cx: &mut TestAppContext) {
+        let (setup, cx) = open(cx);
+        setup.draw_for_the_sibling(cx);
+        let (breathe, _) = node_named(cx, "Breathe").expect("the control is in the tree");
+
+        cx.update(|window, cx| {
+            window.handle_a11y_action(
+                ActionRequest {
+                    action: Action::Click,
+                    target_tree: TreeId::ROOT,
+                    target_node: breathe,
+                    data: None,
+                },
+                cx,
+            )
+        });
+
+        assert_eq!(setup.clicks.get(), 1);
+    }
+}

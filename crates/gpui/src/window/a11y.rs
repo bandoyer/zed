@@ -221,6 +221,18 @@ impl A11y {
         self.active_this_frame
     }
 
+    /// Turns accessibility on as a platform adapter would, from the next frame.
+    #[cfg(test)]
+    pub(crate) fn activate_for_test(&self) {
+        self.active_flag.store(true, Ordering::SeqCst);
+    }
+
+    /// The tree sent to the platform after the last frame.
+    #[cfg(test)]
+    pub(crate) fn last_tree_update(&self) -> Option<&TreeUpdate> {
+        self.debug.last_tree_update()
+    }
+
     pub(crate) fn set_focusable(&mut self, node_id: NodeId, focus_id: FocusId) {
         self.focus_ids.insert(node_id, focus_id);
     }
